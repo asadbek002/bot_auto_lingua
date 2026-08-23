@@ -17,6 +17,7 @@ export async function getBotModeCached(): Promise<"crm" | "auto"> {
   try {
     const res = await fetch(`${env.LINGUA_MANAGER_API_URL}/bot/status`, {
       headers: {
+        "X-Bot-Secret": env.LINGUA_MANAGER_API_KEY,
         "x-api-key": env.LINGUA_MANAGER_API_KEY,
       },
       signal: AbortSignal.timeout(3000),
@@ -61,6 +62,7 @@ export async function forwardToCRM(
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        "X-Bot-Secret": env.LINGUA_MANAGER_API_KEY,
         "x-api-key": env.LINGUA_MANAGER_API_KEY,
       },
       body: JSON.stringify(payload),

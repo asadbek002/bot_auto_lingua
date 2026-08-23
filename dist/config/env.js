@@ -8,8 +8,8 @@ const envSchema = z.object({
     ANTHROPIC_API_KEY: z.string().optional().default(""),
     CLAUDE_MODEL: z.string().default("claude-3-5-sonnet-latest"),
     GEMINI_API_KEY: z.string().optional().default(""),
-    GEMINI_MODEL: z.string().default("gemini-2.0-flash"),
-    GEMINI_MODEL_LITE: z.string().default("gemini-2.0-flash"),
+    GEMINI_MODEL: z.string().default("gemini-2.5-flash"),
+    GEMINI_MODEL_LITE: z.string().default("gemini-2.5-flash-lite"),
     GOOGLE_SERVICE_ACCOUNT_JSON: z.string().default("./google-service-account.json"),
     GOOGLE_SHEETS_SPREADSHEET_ID: z.string().optional().default(""),
     GOOGLE_DRIVE_ROOT_FOLDER_ID: z.string().optional().default(""),
@@ -26,6 +26,11 @@ const envSchema = z.object({
     LOG_FILE_PATH: z.string().default("./logs/agent.log"),
     DEADLINE_CHECK_INTERVAL_MINUTES: z.coerce.number().int().positive().default(60),
     AUTO_TRAIN_INTERVAL_HOURS: z.coerce.number().int().positive().default(24),
+    LINGUA_MANAGER_API_URL: z.string().default("https://linguamanager.duckdns.org/api"),
+    LINGUA_MANAGER_API_KEY: z.string().default("secret_key"),
+    BOT_MODE: z.enum(["crm", "auto"]).default("crm"),
+    BOT_WEBHOOK_PORT: z.coerce.number().int().positive().default(3001),
+    BOT_WEBHOOK_SECRET: z.string().default("secret_key"),
 });
 function loadEnv() {
     const parsed = envSchema.safeParse(process.env);

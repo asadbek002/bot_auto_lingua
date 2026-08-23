@@ -29,6 +29,12 @@ function parseArgs(argv) {
             if (p === "claude" || p === "gemini")
                 args.provider = p;
         }
+        else if (arg === "claude" || arg === "gemini") {
+            args.provider = arg;
+        }
+        else if (!args.ownerName && arg && !arg.startsWith("-")) {
+            args.ownerName = arg;
+        }
     }
     return args;
 }

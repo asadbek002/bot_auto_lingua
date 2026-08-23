@@ -7,6 +7,7 @@ import { createTelegramPort, createGenericTelegramPort, sendBusinessMessage } fr
 import { downloadTelegramFile, looksLikeReceipt } from "./files.js";
 import { parseCommandTarget, formatExcludedList } from "./commands.js";
 import { addExcluded, removeExcluded, listExcluded } from "../sheets/excluded.js";
+import { forwardToCRM, getBotModeCached, startCRMWebhookServer } from "./crmBridge.js";
 function toHandleMessageDeps(deps, telegram) {
     return {
         spreadsheetId: deps.spreadsheetId,
@@ -54,6 +55,7 @@ export function createBot(token, deps) {
                 incoming = {
                     ...base,
                     kind: "voice",
+                    fileId: msg.voice.file_id,
                     fileBuffer: dl.buffer,
                     fileMimeType: dl.mimeType,
                     fileName: dl.fileName,
@@ -66,6 +68,7 @@ export function createBot(token, deps) {
                     ...base,
                     kind: "photo",
                     caption: msg.caption,
+                    fileId: largest.file_id,
                     fileBuffer: dl.buffer,
                     fileMimeType: dl.mimeType,
                     fileName: dl.fileName,
@@ -78,6 +81,7 @@ export function createBot(token, deps) {
                     ...base,
                     kind: "document",
                     caption: msg.caption,
+                    fileId: msg.document.file_id,
                     fileBuffer: dl.buffer,
                     fileMimeType: dl.mimeType,
                     fileName: dl.fileName,
@@ -87,8 +91,19 @@ export function createBot(token, deps) {
             else {
                 incoming = { ...base, kind: "text", text: msg.text ?? "" };
             }
-            const telegramPort = createTelegramPort(bot, businessConnectionId, clientChatId);
-            await handleMessage(incoming, toHandleMessageDeps(deps, telegramPort));
+            const botMode = await getBotModeCached();
+            if (botMode === "crm") {
+                if (deps.store.hasProcessedUpdate(ctx.update.update_id)) {
+                    logger.debug({ updateId: ctx.update.update_id }, "Skipping already-processed update in CRM mode");
+                    return;
+                }
+                deps.store.markUpdateProcessed(ctx.update.update_id);
+                await forwardToCRM(incoming, bot.api);
+            }
+            else {
+                const telegramPort = createTelegramPort(bot, businessConnectionId, clientChatId);
+                await handleMessage(incoming, toHandleMessageDeps(deps, telegramPort));
+            }
         }
         catch (err) {
             logger.error({ err }, "Unhandled error in business_message handler");
@@ -109,6 +124,7 @@ export function createBot(token, deps) {
     });
     registerWorkChatCommands(bot, deps);
     registerEscalationResolution(bot, resolveDeps);
+    startCRMWebhookServer(bot);
     return bot;
 }
 function isFromWorkChat(chatId) {
