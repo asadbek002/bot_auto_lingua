@@ -1,0 +1,26 @@
+{
+  "currency": "UZS",
+  "translation": {
+    "unit": "list",
+    "standard_to_english": 60000,
+    "notarized_to_english": 100000,
+    "soliq_qaytarish_to_english": 50000,
+    "note": "Soliq (tax-refund) tariff applies ONLY when the client has explicitly confirmed the translation purpose is soliq qaytarish. Never inferred automatically."
+  },
+  "apostille": {
+    "unit": "document",
+    "by_document_type": {
+      "diplom": 250000,
+      "guvohnoma": 200000,
+      "tugilganlik_haqida_guvohnoma": 200000,
+      "nikoh_haqida_guvohnoma": 200000,
+      "spravka": 180000,
+      "boshqa": 220000
+    },
+    "note": "Priced per document, not per page. by_document_type keys are placeholders - update with real tariffs per document type once known (e.g. from train.ts analysis of past chats)."
+  },
+  "_meta": {
+    "instructions": "This file is the single source of truth for pricing. Edit values here to change prices; the agent never invents or discounts prices on its own.",
+    "last_updated": "2026-07-04"
+  }
+}

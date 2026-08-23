@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+data/
+logs/
+training_data/
+DataExport_*/
+*.log
+google-service-account.json
+google-oauth-token.json
+.DS_Store
