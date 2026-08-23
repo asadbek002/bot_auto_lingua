@@ -205,6 +205,14 @@ export function startCRMWebhookServer(bot: Bot): http.Server {
     res.end(JSON.stringify({ error: "Not found" }));
   });
 
+  server.on("error", (err: any) => {
+    if (err?.code === "EADDRINUSE") {
+      logger.warn({ port: env.BOT_WEBHOOK_PORT }, "CRM Webhook port already in use, reusing existing listener");
+    } else {
+      logger.error({ err }, "CRM Webhook server error");
+    }
+  });
+
   server.listen(env.BOT_WEBHOOK_PORT, () => {
     logger.info({ port: env.BOT_WEBHOOK_PORT }, "CRM Webhook HTTP server listening");
   });
