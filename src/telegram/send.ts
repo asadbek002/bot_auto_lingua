@@ -5,40 +5,47 @@ import { logger } from "../utils/logger.js";
 import type { HandleMessageDeps } from "../pipeline/handleMessage.js";
 
 const BUSINESS_SEND_RETRIES = 3;
-const BUSINESS_SEND_RETRY_DELAY_MS = 2000;
+let BUSINESS_SEND_RETRY_DELAY_MS = 2000;
+/** Faqat testlar uchun: qayta urinish kutish vaqtini qisqartirish. */
+export function _setBusinessRetryDelay(ms: number): void {
+  BUSINESS_SEND_RETRY_DELAY_MS = ms;
+}
 
 function isBusinessPeerInvalid(err: unknown): boolean {
   return err instanceof GrammyError && err.description?.includes("BUSINESS_PEER_INVALID");
 }
 
 /**
- * Telegram Business Connections intermittently reject sendMessage with
- * BUSINESS_PEER_INVALID even for a peer that just worked (and that works again
- * moments later) - confirmed transient by direct reproduction, not tied to a specific
- * client or message type. Retry a few times before giving up.
+ * Telegram Business Connections intermittently reject sends with BUSINESS_PEER_INVALID even for a
+ * peer that just worked (and that works again moments later) - confirmed transient. Retry a few
+ * times before giving up. Works for any send method (text, photo, voice, document...).
  */
-export async function sendBusinessMessage(
-  bot: Bot,
-  chatId: number,
-  businessConnectionId: string,
-  text: string
-): Promise<void> {
+export async function withBusinessRetry<T>(fn: () => Promise<T>, chatId: number, delayMs?: number): Promise<T> {
+  const delay = delayMs ?? BUSINESS_SEND_RETRY_DELAY_MS;
   let lastErr: unknown;
   for (let attempt = 1; attempt <= BUSINESS_SEND_RETRIES; attempt++) {
     try {
-      await bot.api.sendMessage(chatId, text, { business_connection_id: businessConnectionId });
-      return;
+      return await fn();
     } catch (err) {
       lastErr = err;
       if (!isBusinessPeerInvalid(err) || attempt === BUSINESS_SEND_RETRIES) throw err;
-      logger.warn(
-        { attempt, chatId },
-        "BUSINESS_PEER_INVALID (transient Telegram issue) - retrying send"
-      );
-      await new Promise((resolve) => setTimeout(resolve, BUSINESS_SEND_RETRY_DELAY_MS * attempt));
+      logger.warn({ attempt, chatId }, "BUSINESS_PEER_INVALID (transient Telegram issue) - retrying send");
+      await new Promise((resolve) => setTimeout(resolve, delay * attempt));
     }
   }
   throw lastErr;
+}
+
+export async function sendBusinessMessage(
+  bot: { api: Pick<Bot["api"], "sendMessage"> },
+  chatId: number,
+  businessConnectionId: string,
+  text: string
+) {
+  return withBusinessRetry(
+    () => bot.api.sendMessage(chatId, text, { business_connection_id: businessConnectionId }),
+    chatId
+  );
 }
 
 /**

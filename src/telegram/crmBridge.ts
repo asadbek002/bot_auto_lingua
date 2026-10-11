@@ -1,10 +1,14 @@
-import http from "http";
-import URL from "url";
-import type { Bot } from "grammy";
+import http from "node:http";
+import { createHash, timingSafeEqual } from "node:crypto";
+import path from "node:path";
+import { Readable } from "node:stream";
+import { GrammyError, InputFile, type Bot } from "grammy";
 import { env } from "../config/env.js";
 import { logger } from "../utils/logger.js";
-import { sendBusinessMessage } from "./send.js";
-import type { IncomingMessage } from "../pipeline/handleMessage.js";
+import { sendBusinessMessage, withBusinessRetry } from "./send.js";
+import { Outbox, OUTBOX_MAX_AGE_MS } from "./outbox.js";
+
+// ── Bot rejimi (crm | auto) ─────────────────────────────────────────────────
 
 let cachedMode: { mode: "crm" | "auto"; expiresAt: number } | null = null;
 
@@ -38,172 +42,307 @@ export async function getBotModeCached(): Promise<"crm" | "auto"> {
   return fallback;
 }
 
-export async function forwardToCRM(
-  incoming: IncomingMessage,
-  botApi: Bot["api"]
-): Promise<void> {
-  const payload = {
-    chat_id: String(incoming.clientChatId),
-    business_connection_id: incoming.businessConnectionId,
-    client_user_id: incoming.clientUserId,
-    client_name: incoming.clientName,
-    client_username: "",
-    message_type: incoming.kind,
-    text: incoming.text ?? incoming.caption ?? "",
-    file_id: incoming.fileId ?? "",
-    file_name: incoming.fileName ?? "",
-    file_mime_type: incoming.fileMimeType ?? "",
-    direction: "incoming",
-    timestamp: Math.floor(Date.now() / 1000),
+// ── CRM ga yuborish: qayta urinish + diskdagi navbat ────────────────────────
+
+export interface CrmPayload {
+  chat_id: string;
+  business_connection_id: string;
+  client_user_id: string;
+  client_name: string;
+  client_username: string;
+  message_type: string;
+  text: string;
+  file_id: string;
+  file_name: string;
+  file_mime_type: string;
+  direction: "incoming" | "outgoing";
+  timestamp: number;
+  tg_message_id: number;
+  event?: "message" | "edited";
+}
+
+export type PostResult = { ok: true } | { ok: false; retryable: boolean; error: string };
+
+type Notify = (text: string) => Promise<unknown>;
+
+let outbox: Outbox | null = null;
+let notifyWork: Notify | null = null;
+let lastStuckAlertAt = 0;
+
+export function getOutbox(): Outbox {
+  if (!outbox) {
+    const file = process.env.CRM_OUTBOX_PATH || path.join(path.dirname(env.STATE_FILE_PATH), "crm-outbox.json");
+    outbox = new Outbox(file);
+  }
+  return outbox;
+}
+
+/** Testlar uchun: navbat va ogohlantirishni almashtirish. */
+export function configureCrmBridge(opts: { outbox?: Outbox | null; notify?: Notify | null }): void {
+  if (opts.outbox !== undefined) outbox = opts.outbox;
+  if (opts.notify !== undefined) notifyWork = opts.notify;
+}
+
+function apiHeaders(): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    "X-Bot-Secret": env.LINGUA_MANAGER_API_KEY,
+    "x-api-key": env.LINGUA_MANAGER_API_KEY,
   };
+}
 
+export async function postToApi(pathname: string, body: unknown): Promise<PostResult> {
   try {
-    const res = await fetch(`${env.LINGUA_MANAGER_API_URL}/messages`, {
+    const res = await fetch(`${env.LINGUA_MANAGER_API_URL}${pathname}`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Bot-Secret": env.LINGUA_MANAGER_API_KEY,
-        "x-api-key": env.LINGUA_MANAGER_API_KEY,
-      },
-      body: JSON.stringify(payload),
+      headers: apiHeaders(),
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15_000),
     });
-
-    if (!res.ok) {
-      const errText = await res.text();
-      throw new Error(`CRM API HTTP ${res.status}: ${errText}`);
-    }
-
-    logger.info({ chatId: incoming.clientChatId }, "Successfully forwarded message to LinguaManager CRM");
+    if (res.ok) return { ok: true };
+    const errText = (await res.text()).slice(0, 300);
+    // 5xx va 429 — vaqtinchalik (qayta uriniladi); boshqa 4xx — sozlama/ma'lumot xatosi, qayta urinish foydasiz
+    return { ok: false, retryable: res.status >= 500 || res.status === 429, error: `CRM API HTTP ${res.status}: ${errText}` };
   } catch (err) {
-    logger.error({ err, chatId: incoming.clientChatId }, "Failed to forward message to CRM API");
-    if (env.WORK_CHAT_ID) {
-      await botApi
-        .sendMessage(
-          env.WORK_CHAT_ID,
-          `⚠️ CRM ULANISH XATOLIGI\nClient: ${incoming.clientName} (${incoming.clientChatId})\nXabar CRM API ga uzatilmadi: ${err instanceof Error ? err.message : String(err)}`
-        )
-        .catch((sendErr) => logger.error({ sendErr }, "Work chat alert failed"));
-    }
+    return { ok: false, retryable: true, error: err instanceof Error ? err.message : String(err) };
   }
 }
 
-export function startCRMWebhookServer(bot: Bot): http.Server {
-  const server = http.createServer(async (req, res) => {
-    const reqUrl = req.url ?? "/";
-    const parsedUrl = URL.parse(reqUrl, true);
-    const pathname = parsedUrl.pathname ?? "/";
+const QUICK_RETRY_DELAYS_MS = [0, 800, 2500];
 
-    // Health check endpoint
+async function sleep(ms: number): Promise<void> {
+  if (ms > 0) await new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Xabarni CRM ga yuboradi. Qisqa qayta urinishlar, so'ng diskdagi navbat — API qayta ishga tushayotganda
+ * (deploy ~10-15 s) xabar yo'qolmaydi. Mijozga hech qachon xabar yozmaydi.
+ */
+export async function sendToCrm(pathname: string, payload: Record<string, unknown>, quickDelays = QUICK_RETRY_DELAYS_MS): Promise<"sent" | "queued" | "dropped"> {
+  let last: PostResult = { ok: false, retryable: true, error: "no attempt" };
+  for (const delay of quickDelays) {
+    await sleep(delay);
+    last = await postToApi(pathname, payload);
+    if (last.ok) return "sent";
+    if (!last.retryable) break;
+  }
+  if (last.ok) return "sent";
+  if (!last.retryable) {
+    logger.error({ error: last.error, pathname }, "CRM rejected the message (not retryable) - dropped");
+    if (notifyWork) {
+      await notifyWork(`⚠️ CRM xabarni qabul qilmadi (qayta urinilmaydi)\n${last.error}`).catch(() => undefined);
+    }
+    return "dropped";
+  }
+  getOutbox().add({ __path: pathname, ...payload });
+  logger.warn({ error: last.error, queued: getOutbox().size() }, "CRM unreachable - message queued for retry");
+  return "queued";
+}
+
+export async function forwardToCRM(payload: CrmPayload): Promise<"sent" | "queued" | "dropped"> {
+  return sendToCrm("/messages", payload as unknown as Record<string, unknown>);
+}
+
+/** Navbatdagi xabarlarni qayta yuboradi. Interval bilan chaqiriladi. */
+export async function flushOutbox(now = Date.now()): Promise<{ sent: number; left: number }> {
+  const box = getOutbox();
+  const expired = box.expire(now);
+  if (expired.length && notifyWork) {
+    await notifyWork(`⚠️ CRM ga ${expired.length} ta xabar 48 soat davomida yetkazilmadi va navbatdan chiqarildi`).catch(() => undefined);
+  }
+  let sent = 0;
+  for (const item of box.due(now)) {
+    const { __path, ...payload } = item.payload as Record<string, unknown> & { __path?: string };
+    const res = await postToApi(typeof __path === "string" ? __path : "/messages", payload);
+    if (res.ok || !res.retryable) {
+      box.remove(item.id);
+      if (res.ok) sent += 1;
+      else logger.error({ error: res.error }, "Outbox item rejected by CRM - dropped");
+    } else {
+      box.failed(item.id, now);
+    }
+  }
+  // Navbat 10 daqiqadan ortiq tiqilib qolsa — ish chatiga bir marta ogohlantirish (soatiga bir)
+  if (box.size() > 0 && box.oldestAgeMs(now) > 10 * 60_000 && now - lastStuckAlertAt > 3_600_000 && notifyWork) {
+    lastStuckAlertAt = now;
+    await notifyWork(`⚠️ CRM ga ${box.size()} ta xabar yetkazilmayapti (API javob bermayapti). Xabarlar saqlanmoqda va keyin yuboriladi.`).catch(() => undefined);
+  }
+  return { sent, left: box.size() };
+}
+
+export function startOutboxFlusher(intervalMs = 30_000): NodeJS.Timeout {
+  void flushOutbox();                      // ishga tushganda diskdagi qoldiqni darrov yuboramiz
+  const timer = setInterval(() => void flushOutbox(), intervalMs);
+  timer.unref?.();
+  return timer;
+}
+
+export const _constants = { OUTBOX_MAX_AGE_MS };
+
+// ── Panel → Telegram (HTTP server) ──────────────────────────────────────────
+
+type SendApi = Pick<Bot["api"], "sendMessage" | "sendPhoto" | "sendVoice" | "sendVideo" | "sendAudio" | "sendDocument" | "getFile">;
+export interface BotLike {
+  api: SendApi;
+  token?: string;
+}
+
+const MAX_JSON_BYTES = 1024 * 1024;
+const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;      // Telegram Bot API yuklash limiti
+
+const digest = (v: string) => createHash("sha256").update(v).digest();
+
+export function isAuthorized(provided: string | string[] | undefined, secret: string): boolean {
+  const value = Array.isArray(provided) ? provided[0] : provided;
+  if (!value || !secret) return false;
+  return timingSafeEqual(digest(value), digest(secret));    // vaqt bo'yicha hujum qilib bo'lmaydi
+}
+
+function json(res: http.ServerResponse, status: number, body: unknown): void {
+  const raw = JSON.stringify(body);
+  res.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(raw) });
+  res.end(raw);
+}
+
+function readBody(req: http.IncomingMessage, limit: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => {
+      size += c.length;
+      if (size > limit) {
+        reject(Object.assign(new Error("Body too large"), { statusCode: 413 }));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+    req.on("error", reject);
+  });
+}
+
+/** Telegram/ichki xatoni (status, xabar) ga aylantiradi: panel sababini ko'rsatadi. */
+function failure(err: unknown): { status: number; body: { error: string; error_code?: number } } {
+  if (err instanceof GrammyError) {
+    return { status: 502, body: { error: err.description, error_code: err.error_code } };
+  }
+  const statusCode = (err as { statusCode?: number })?.statusCode;
+  return { status: statusCode ?? 500, body: { error: err instanceof Error ? err.message : String(err) } };
+}
+
+function sentFileId(msg: any): string {
+  if (!msg) return "";
+  if (Array.isArray(msg.photo) && msg.photo.length) return msg.photo[msg.photo.length - 1].file_id ?? "";
+  return (msg.voice ?? msg.video ?? msg.audio ?? msg.document ?? msg.animation)?.file_id ?? "";
+}
+
+async function handleReply(bot: BotLike, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  const body = JSON.parse(await readBody(req, MAX_JSON_BYTES)) as { client_chat_id?: number | string; business_connection_id?: string; text?: string };
+  if (!body.client_chat_id || !body.business_connection_id || !body.text) {
+    json(res, 400, { error: "Missing required fields" });
+    return;
+  }
+  const sent = await sendBusinessMessage(bot, Number(body.client_chat_id), body.business_connection_id, body.text);
+  json(res, 200, { ok: true, message_id: sent?.message_id ?? 0 });
+}
+
+async function handleReplyFile(bot: BotLike, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  const length = Number(req.headers["content-length"] ?? 0);
+  if (length > MAX_UPLOAD_BYTES + 1024 * 1024) {
+    json(res, 413, { error: "Fayl juda katta (Telegram 50 MB gacha qabul qiladi)" });
+    return;
+  }
+  // Node 22: Web Request orqali multipart ni qo'shimcha kutubxonasiz o'qiymiz
+  const request = new Request("http://localhost/", {
+    method: "POST",
+    headers: req.headers as Record<string, string>,
+    body: Readable.toWeb(req) as unknown as ReadableStream,
+    duplex: "half",
+  } as RequestInit);
+  const form = await request.formData();
+  const chatId = Number(form.get("client_chat_id"));
+  const connectionId = String(form.get("business_connection_id") ?? "");
+  const caption = String(form.get("text") ?? "");
+  const msgType = String(form.get("msg_type") ?? "document");
+  const file = form.get("file");
+  if (!chatId || !connectionId || !(file instanceof File)) {
+    json(res, 400, { error: "Missing required fields" });
+    return;
+  }
+  if (file.size > MAX_UPLOAD_BYTES) {
+    json(res, 413, { error: "Fayl juda katta (Telegram 50 MB gacha qabul qiladi)" });
+    return;
+  }
+  const buffer = Buffer.from(await file.arrayBuffer());
+  const make = () => new InputFile(buffer, file.name || "file");
+  const opts = { business_connection_id: connectionId, ...(caption ? { caption } : {}) };
+
+  const sent = await withBusinessRetry<any>(() => {
+    switch (msgType) {
+      case "photo": return bot.api.sendPhoto(chatId, make(), opts);
+      case "voice": return bot.api.sendVoice(chatId, make(), opts);
+      case "video": return bot.api.sendVideo(chatId, make(), opts);
+      case "audio": return bot.api.sendAudio(chatId, make(), opts);
+      default: return bot.api.sendDocument(chatId, make(), opts);
+    }
+  }, chatId);
+  json(res, 200, { ok: true, message_id: sent?.message_id ?? 0, file_id: sentFileId(sent) });
+}
+
+export function createCrmServer(bot: BotLike, secret: string = env.BOT_WEBHOOK_SECRET): http.Server {
+  return http.createServer(async (req, res) => {
+    const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+
     if (req.method === "GET" && pathname === "/health") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok" }));
+      json(res, 200, { status: "ok", queued: getOutbox().size() });
       return;
     }
 
-    // Proxy file streaming for media from Telegram API
-    if (req.method === "GET" && pathname.startsWith("/crm-webhook/file")) {
-      const fileId = (parsedUrl.query.file_id as string) || pathname.split("/").pop();
-      if (!fileId) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Missing file_id" }));
-        return;
-      }
+    // Qolgan hamma endpointlar maxfiy kalit talab qiladi (avval fayl oqimi ochiq edi)
+    const authorized = isAuthorized(req.headers["x-api-key"], secret);
 
-      try {
+    try {
+      if (req.method === "GET" && pathname.startsWith("/crm-webhook/file")) {
+        if (!authorized) { json(res, 401, { error: "Unauthorized" }); return; }
+        const fileId = new URL(req.url ?? "/", "http://localhost").searchParams.get("file_id") || pathname.split("/").pop();
+        if (!fileId) { json(res, 400, { error: "Missing file_id" }); return; }
         const file = await bot.api.getFile(fileId);
-        if (!file.file_path) {
-          throw new Error("No file_path returned from Telegram");
-        }
-
-        const telegramFileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
-        const fileRes = await fetch(telegramFileUrl);
-
-        if (!fileRes.ok || !fileRes.body) {
-          res.writeHead(fileRes.status, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Failed to download from Telegram" }));
-          return;
-        }
-
+        if (!file.file_path) throw new Error("No file_path returned from Telegram");
+        const fileRes = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${file.file_path}`);
+        if (!fileRes.ok || !fileRes.body) { json(res, fileRes.status, { error: "Failed to download from Telegram" }); return; }
         res.writeHead(200, {
           "Content-Type": fileRes.headers.get("content-type") || "application/octet-stream",
-          "Content-Length": fileRes.headers.get("content-length") || "",
+          ...(fileRes.headers.get("content-length") ? { "Content-Length": fileRes.headers.get("content-length")! } : {}),
         });
-
-        // Web ReadableStream to Node stream piping
-        const reader = fileRes.body.getReader();
-        const pump = async () => {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            res.write(Buffer.from(value));
-          }
-          res.end();
-        };
-        await pump();
-        return;
-      } catch (err) {
-        logger.error({ err, fileId }, "Error streaming file from Telegram API");
-        if (!res.headersSent) {
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "File download error" }));
-        }
-        return;
-      }
-    }
-
-    // Reply webhook from CRM
-    if (req.method === "POST" && pathname === "/crm-webhook/reply") {
-      const apiKey = req.headers["x-api-key"];
-      if (apiKey !== env.BOT_WEBHOOK_SECRET) {
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Unauthorized" }));
+        Readable.fromWeb(fileRes.body as never).pipe(res);
         return;
       }
 
-      let bodyStr = "";
-      req.on("data", (chunk) => {
-        bodyStr += chunk;
-      });
+      if (req.method === "POST" && pathname === "/crm-webhook/reply") {
+        if (!authorized) { json(res, 401, { error: "Unauthorized" }); return; }
+        await handleReply(bot, req, res);
+        return;
+      }
 
-      req.on("end", async () => {
-        try {
-          const body = JSON.parse(bodyStr) as {
-            client_chat_id: number | string;
-            business_connection_id: string;
-            text: string;
-          };
+      if (req.method === "POST" && pathname === "/crm-webhook/reply-file") {
+        if (!authorized) { json(res, 401, { error: "Unauthorized" }); return; }
+        await handleReplyFile(bot, req, res);
+        return;
+      }
 
-          if (!body.client_chat_id || !body.business_connection_id || !body.text) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Missing required fields" }));
-            return;
-          }
-
-          await sendBusinessMessage(
-            bot,
-            Number(body.client_chat_id),
-            body.business_connection_id,
-            body.text
-          );
-
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ ok: true }));
-        } catch (err) {
-          logger.error({ err, bodyStr }, "Failed to process CRM reply webhook");
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              error: err instanceof Error ? err.message : String(err),
-            })
-          );
-        }
-      });
-      return;
+      json(res, 404, { error: "Not found" });
+    } catch (err) {
+      logger.error({ err, pathname }, "CRM webhook request failed");
+      if (res.headersSent) { res.end(); return; }
+      const f = failure(err);
+      json(res, f.status, f.body);
     }
-
-    res.writeHead(404, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Not found" }));
   });
+}
+
+export function startCRMWebhookServer(bot: Bot): http.Server {
+  const server = createCrmServer(bot);
 
   server.on("error", (err: any) => {
     if (err?.code === "EADDRINUSE") {
@@ -217,5 +356,9 @@ export function startCRMWebhookServer(bot: Bot): http.Server {
     logger.info({ port: env.BOT_WEBHOOK_PORT }, "CRM Webhook HTTP server listening");
   });
 
+  configureCrmBridge({
+    notify: env.WORK_CHAT_ID ? (text) => bot.api.sendMessage(env.WORK_CHAT_ID, text) : null,
+  });
+  startOutboxFlusher();
   return server;
 }

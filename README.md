@@ -129,3 +129,28 @@ Bot API calls themselves (`sendMessage` with `business_connection_id`, `getFile`
 is implemented per the documented API, but the live "does Telegram actually deliver and
 show the message correctly" step needs your manual verification once the business
 connection is set up.
+
+
+## 7. CRM rejimi (LinguaManager bilan ishlash)
+
+`BOT_MODE=crm` (yoki LinguaManager `/bot/status`): AI o'chiq, bot "ko'prik" vazifasini bajaradi.
+
+**Qabul (Telegram → CRM):**
+- Barcha xabar turlari uzatiladi: matn, rasm, ovoz, audio, video, dumaloq video, GIF, stiker, hujjat, joylashuv,
+  kontakt (qolganlari `unknown` va aniq matn bilan). Fayl **yuklanmaydi** — faqat `file_id` (katta fayl ham yo'qolmaydi).
+- Biznes egasining telefondan yozgan javoblari ham CRM ga "chiquvchi" sifatida boradi.
+- Tahrirlangan va o'chirilgan xabarlar CRM da belgilanadi.
+- Har xabar `tg_message_id` bilan yuboriladi: qayta yuborilsa CRM ikkilantirmaydi.
+- API o'chiq/qayta ishga tushayotgan bo'lsa — xabar `data/crm-outbox.json` navbatiga tushadi va keyin yetkaziladi
+  (48 soatgacha; 10 daqiqadan ortiq tiqilsa ish chatiga ogohlantirish).
+- Mijozga hech qachon "texnik nosozlik" xabari yozilmaydi (bu faqat AI rejimida).
+
+**Yuborish (CRM → Telegram)** — maxfiy kalit (`x-api-key`) talab qiladi:
+- `POST /crm-webhook/reply` — matn (JSON) → `{ok, message_id}`
+- `POST /crm-webhook/reply-file` — fayl (multipart: `client_chat_id`, `business_connection_id`, `text`, `msg_type`
+  = photo|voice|video|audio|document, `file`) → `{ok, message_id, file_id}`
+- Telegram xatosi `502` + `{error, error_code}` bilan qaytadi (CRM panelda sabab ko'rsatadi);
+  `BUSINESS_PEER_INVALID` avtomatik qayta uriniladi.
+- `GET /crm-webhook/file?file_id=…` — endi u ham kalit talab qiladi (avval ochiq edi).
+
+Testlar: `npm test` (`.env` shart emas).

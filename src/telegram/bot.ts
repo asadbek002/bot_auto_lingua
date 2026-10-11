@@ -7,7 +7,8 @@ import { createTelegramPort, createGenericTelegramPort, sendBusinessMessage } fr
 import { downloadTelegramFile, looksLikeReceipt } from "./files.js";
 import { parseCommandTarget, formatExcludedList } from "./commands.js";
 import { addExcluded, removeExcluded, listExcluded } from "../sheets/excluded.js";
-import { forwardToCRM, getBotModeCached, startCRMWebhookServer } from "./crmBridge.js";
+import { getBotModeCached, startCRMWebhookServer } from "./crmBridge.js";
+import { handleCrmBusinessMessage, handleCrmDeleted, type CrmCtx } from "./crmHandlers.js";
 import type { Store } from "../state/store.js";
 import type { PriceList } from "../sheets/priceList.js";
 
@@ -42,8 +43,21 @@ export function createBot(token: string, deps: BotStaticDeps): Bot {
   const bot = new Bot(token);
   const resolveDeps = toHandleMessageDeps(deps, createGenericTelegramPort(bot));
 
+  const crmDeps = {
+    store: deps.store,
+    alert: env.WORK_CHAT_ID ? (text: string) => bot.api.sendMessage(env.WORK_CHAT_ID, text) : undefined,
+  };
+
   bot.on("business_message", async (ctx) => {
     if (ctx.chat?.type !== "private") return;
+
+    // CRM rejimi (AI o'chiq): rejim AVVAL tekshiriladi. Fayl yuklanmaydi (faqat file_id uzatiladi), shuning
+    // uchun katta fayl yoki yuklash xatosi xabarni yo'qotmaydi va mijozga "texnik nosozlik" yozilmaydi.
+    // Biznes egasining telefondan yozgan javoblari ham CRM ga "chiquvchi" sifatida boradi.
+    if ((await getBotModeCached()) === "crm") {
+      await handleCrmBusinessMessage(ctx as unknown as CrmCtx, crmDeps);
+      return;
+    }
 
     // Captured up front (both are plain context shortcuts, no network call) so a
     // fallback message can still reach the client even if something fails before
@@ -125,18 +139,9 @@ export function createBot(token: string, deps: BotStaticDeps): Bot {
         incoming = { ...base, kind: "text", text: msg.text ?? "" };
       }
 
-      const botMode = await getBotModeCached();
-      if (botMode === "crm") {
-        if (deps.store.hasProcessedUpdate(ctx.update.update_id)) {
-          logger.debug({ updateId: ctx.update.update_id }, "Skipping already-processed update in CRM mode");
-          return;
-        }
-        deps.store.markUpdateProcessed(ctx.update.update_id);
-        await forwardToCRM(incoming, bot.api);
-      } else {
-        const telegramPort = createTelegramPort(bot, businessConnectionId!, clientChatId);
-        await handleMessage(incoming, toHandleMessageDeps(deps, telegramPort));
-      }
+      // AI (auto) rejimi — avvalgi mantiq o'zgarmagan
+      const telegramPort = createTelegramPort(bot, businessConnectionId!, clientChatId);
+      await handleMessage(incoming, toHandleMessageDeps(deps, telegramPort));
     } catch (err) {
       logger.error({ err }, "Unhandled error in business_message handler");
       // Everything inside handleMessage already degrades gracefully on its own
@@ -161,6 +166,16 @@ export function createBot(token: string, deps: BotStaticDeps): Bot {
           .catch((sendErr) => logger.error({ sendErr }, "Fallback work-chat notice also failed"));
       }
     }
+  });
+
+  // Tahrirlangan va o'chirilgan xabarlar (faqat CRM rejimida CRM ga uzatiladi)
+  bot.on("edited_business_message", async (ctx) => {
+    if ((await getBotModeCached()) !== "crm") return;
+    await handleCrmBusinessMessage(ctx as unknown as CrmCtx, crmDeps, "edited");
+  });
+  bot.on("deleted_business_messages", async (ctx) => {
+    if ((await getBotModeCached()) !== "crm") return;
+    await handleCrmDeleted(ctx as unknown as CrmCtx);
   });
 
   registerWorkChatCommands(bot, deps);
