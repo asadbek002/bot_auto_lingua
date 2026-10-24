@@ -90,6 +90,7 @@ async function main() {
   });
 
   await bot.start({
+    allowed_updates: ["message", "business_message", "business_connection", "edited_business_message", "deleted_business_messages", "callback_query"],
     onStart: () => logger.info("bot polling started"),
   });
 }

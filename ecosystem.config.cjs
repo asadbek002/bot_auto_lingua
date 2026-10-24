@@ -9,6 +9,7 @@ module.exports = {
       max_restarts: 20,
       restart_delay: 3000,
       watch: false,
+      env_file: ".env",
       env: {
         NODE_ENV: "production",
       },
